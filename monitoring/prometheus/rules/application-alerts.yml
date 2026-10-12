@@ -1,0 +1,20 @@
+groups:
+  - name: application-health
+    rules:
+      - alert: ApplicationUnhealthy
+        expr: application_health_status == 0
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Application is unhealthy"
+          description: "The self-healing application has reported an unhealthy state for at least 15 seconds."
+
+      - alert: ApplicationMetricsTargetDown
+        expr: up{job="application"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Application metrics target is down"
+          description: "Prometheus has been unable to scrape the application metrics endpoint for at least 30 seconds."
