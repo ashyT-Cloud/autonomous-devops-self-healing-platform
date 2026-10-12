@@ -28,3 +28,6 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# Saved Terraform plan files
+tfplan
