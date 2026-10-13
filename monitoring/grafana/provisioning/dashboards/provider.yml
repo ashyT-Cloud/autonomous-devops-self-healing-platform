@@ -1,0 +1,10 @@
+apiVersion: 1
+
+providers:
+  - name: Self-Healing Platform
+    orgId: 1
+    folder: Autonomous DevOps
+    type: file
+    disableDeletion: true
+    options:
+      path: /var/lib/grafana/dashboards

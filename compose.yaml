@@ -65,9 +65,25 @@ services:
     networks:
       - monitoring
 
+  grafana:
+    image: grafana/grafana:12.1.1
+    container_name: project8-grafana
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    networks:
+      - monitoring
+
 networks:
   monitoring:
 
 volumes:
   prometheus-data:
   alertmanager-data:
+  grafana-data:
