@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 
 import argparse
@@ -6,6 +7,17 @@ import os
 import time
 import urllib.error
 import urllib.request
+import threading
+
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
+
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -17,7 +29,8 @@ AUTO_REMEDIATE = os.getenv("AUTO_REMEDIATE", "true").lower() == "true"
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "127.0.0.1")
 WEBHOOK_PORT = max(1, int(os.getenv("WEBHOOK_PORT", "8081")))
 MAX_WEBHOOK_BYTES = 1_048_576
-
+METRICS_HOST = os.getenv("METRICS_HOST", "0.0.0.0")
+METRICS_PORT = max(1, int(os.getenv("METRICS_PORT", "8082")))
 
 def log_event(event, **details):
     record = {
@@ -90,6 +103,33 @@ class IncidentController:
         self.sleep_fn = sleep_fn
         self.last_remediation_at = None
         self.active_alerts = set()
+        self.registry = CollectorRegistry()
+
+        self.incidents_detected = Counter(
+            "incidents_detected",
+            "Number of incidents detected by the controller.",
+            ["incident_type"],
+            registry=self.registry,
+        )
+
+        self.remediation_attempts = Counter(
+            "remediation_attempts",
+            "Number of remediation attempts by outcome.",
+            ["result"],
+            registry=self.registry,
+        )
+
+        self.remediation_duration = Histogram(
+            "remediation_duration_seconds",
+            "Time spent attempting and verifying remediation.",
+            registry=self.registry,
+        )
+
+        self.controller_up = Gauge(
+            "incident_controller_up",
+            "Whether the controller metrics service is running.",
+            registry=self.registry,
+        )
 
     def run_check(self):
         status, body = self.health_request()
@@ -99,6 +139,10 @@ class IncidentController:
             return True
 
         if status is None:
+            self.incidents_detected.labels(
+                incident_type="service_unreachable"
+            ).inc()
+
             log_event(
                 "service_unreachable",
                 result="unknown",
@@ -106,6 +150,10 @@ class IncidentController:
                 remediation="not_attempted",
             )
             return False
+
+        self.incidents_detected.labels(
+            incident_type="application_unhealthy"
+        ).inc()
 
         log_event(
             "incident_detected",
@@ -123,6 +171,7 @@ class IncidentController:
             return False
 
         now = time.monotonic()
+
         if (
             self.last_remediation_at is not None
             and now - self.last_remediation_at < self.cooldown_seconds
@@ -130,6 +179,7 @@ class IncidentController:
             remaining = self.cooldown_seconds - (
                 now - self.last_remediation_at
             )
+
             log_event(
                 "remediation_skipped",
                 reason="cooldown_active",
@@ -138,39 +188,56 @@ class IncidentController:
             return False
 
         self.last_remediation_at = now
+        remediation_started = time.monotonic()
 
-        recovery_status, recovery_body = self.recovery_request()
-        log_event(
-            "remediation_attempt",
-            http_status=recovery_status,
-            details=recovery_body,
-        )
+        try:
+            recovery_status, recovery_body = self.recovery_request()
 
-        if recovery_status is None or not 200 <= recovery_status < 300:
             log_event(
-                "remediation_result",
-                result="recovery_failed",
+                "remediation_attempt",
                 http_status=recovery_status,
                 details=recovery_body,
             )
-            return False
 
-        self.sleep_fn(self.verify_delay)
-        verify_status, verify_body = self.health_request()
+            if (
+                recovery_status is None
+                or not 200 <= recovery_status < 300
+            ):
+                self.remediation_attempts.labels(result="failure").inc()
 
-        recovered = (
-            verify_status == 200
-            and verify_body.get("status") == "healthy"
-        )
+                log_event(
+                    "remediation_result",
+                    result="recovery_failed",
+                    http_status=recovery_status,
+                    details=recovery_body,
+                )
+                return False
 
-        log_event(
-            "remediation_result",
-            result="recovered" if recovered else "recovery_failed",
-            http_status=verify_status,
-            details=verify_body,
-        )
+            self.sleep_fn(self.verify_delay)
+            verify_status, verify_body = self.health_request()
 
-        return recovered
+            recovered = (
+                verify_status == 200
+                and verify_body.get("status") == "healthy"
+            )
+
+            self.remediation_attempts.labels(
+                result="success" if recovered else "failure"
+            ).inc()
+
+            log_event(
+                "remediation_result",
+                result="recovered" if recovered else "recovery_failed",
+                http_status=verify_status,
+                details=verify_body,
+            )
+
+            return recovered
+
+        finally:
+            self.remediation_duration.observe(
+                time.monotonic() - remediation_started
+            )
 
     def process_alertmanager_payload(self, payload):
         if not isinstance(payload, dict):
@@ -314,8 +381,6 @@ def make_webhook_handler(controller):
             )
 
     return AlertmanagerWebhookHandler
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Project 8 autonomous DevOps incident controller"
@@ -344,6 +409,7 @@ def main():
     )
 
     if args.webhook:
+        metrics_server = start_metrics_server(controller)
         server = ThreadingHTTPServer(
             (WEBHOOK_HOST, WEBHOOK_PORT),
             make_webhook_handler(controller),
@@ -359,18 +425,73 @@ def main():
             log_event("controller_stopped", reason="keyboard_interrupt")
         finally:
             server.server_close()
+            stop_metrics_server(metrics_server, controller)
         return
 
     if args.once:
         raise SystemExit(0 if controller.run_check() else 1)
 
+    metrics_server = start_metrics_server(controller)
     try:
         while True:
             controller.run_check()
             time.sleep(CHECK_INTERVAL)
     except KeyboardInterrupt:
         log_event("controller_stopped", reason="keyboard_interrupt")
+    finally:
+        stop_metrics_server(metrics_server, controller)
 
+def make_metrics_handler(controller):
+    class MetricsHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/metrics":
+                self.send_error(404, "Not Found")
+                return
+
+            output = generate_latest(controller.registry)
+
+            self.send_response(200)
+            self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+            self.send_header("Content-Length", str(len(output)))
+            self.end_headers()
+            self.wfile.write(output)
+
+        def log_message(self, format_string, *args):
+            return
+
+    return MetricsHandler
+
+
+def start_metrics_server(controller):
+    server = ThreadingHTTPServer(
+        (METRICS_HOST, METRICS_PORT),
+        make_metrics_handler(controller),
+    )
+
+    server_thread = threading.Thread(
+        target=server.serve_forever,
+        name="controller-metrics-server",
+        daemon=True,
+    )
+    server_thread.start()
+
+    controller.controller_up.set(1)
+
+    log_event(
+        "metrics_server_started",
+        host=METRICS_HOST,
+        port=METRICS_PORT,
+    )
+
+    return server
+
+
+def stop_metrics_server(server, controller):
+    controller.controller_up.set(0)
+    server.shutdown()
+    server.server_close()
+
+    log_event("metrics_server_stopped")
 
 if __name__ == "__main__":
     main()
